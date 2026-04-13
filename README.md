@@ -82,7 +82,7 @@ python AI-Zandero-Agent.py
 
 ## ⚙️ Konfigurasi
 
-Edit bagian ini di `xzv_agent_v3.py`:
+Edit bagian ini di `AI-Zandero-Agent.py`:
 
 ```python
 API_KEY = "YOUR_API_KEY"       # API key LiteLLM / OpenAI kamu
