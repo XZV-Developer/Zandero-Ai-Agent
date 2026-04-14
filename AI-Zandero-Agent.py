@@ -45,27 +45,42 @@ memory = load_memory()
 
 BLOCKED_PATTERNS = ["rm -rf /", ":(){ :|:& };:", "dd if=/dev/zero", "mkfs"]
 
+SHELL_OPS = [">", ">>", "|", "&&", "||", ";", "$(", "`", "2>", "<"]
+
+def needs_shell(cmd: str) -> bool:
+    return any(op in cmd for op in SHELL_OPS)
+
 def execute(cmd: str) -> str:
     try:
         cmd = cmd.strip()
         if not cmd:
             return "[EMPTY COMMAND]"
 
-        if len(cmd) >= 2 and cmd[0] == cmd[-1] and cmd[0] in ('"', "'"):
-            cmd = cmd[1:-1]
-
         for bad in BLOCKED_PATTERNS:
             if bad in cmd:
                 return f"[BLOCKED] Perintah berbahaya ditolak: '{bad}'"
 
-        args = shlex.split(cmd)
-        p = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=os.path.expanduser("~")
-        )
+        cwd = os.path.expanduser("~")
+
+        if needs_shell(cmd):
+            p = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=cwd,
+                executable="/bin/sh"
+            )
+        else:
+            args = shlex.split(cmd)
+            p = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=cwd
+            )
 
         out = (p.stdout or "").strip()
         err = (p.stderr or "").strip()
@@ -81,6 +96,7 @@ def execute(cmd: str) -> str:
         return f"[NOT FOUND] {e} — coba cek apakah program terinstall"
     except Exception as e:
         return f"[EXCEPTION] {type(e).__name__}: {e}"
+
 
 def call_llm(messages: list) -> str | None:
     try:
@@ -121,6 +137,7 @@ def parse_response(res: str) -> tuple[str, str, str, str]:
     m = re.search(r"ACTION:\s*(.+?)(?=\nTHOUGHT:|\nFINAL:|\nMEMORY:|\nACTION:|$)", res, FLAGS)
     if m:
         raw = m.group(1).strip().split("\n")[0].strip()
+
         for label in ["OBSERVATION", "THOUGHT", "FINAL", "ACTION", "MEMORY"]:
             idx = raw.upper().find(label)
             if idx > 0:
@@ -139,6 +156,7 @@ def parse_response(res: str) -> tuple[str, str, str, str]:
 def is_valid(thought: str, action: str, final: str) -> bool:
     return bool(thought or action or final)
 
+
 def trim_history(history: list) -> list:
     """Pertahankan system prompt + trim pesan lama jika context terlalu besar."""
     system_msgs = [m for m in history if m["role"] == "system"]
@@ -150,6 +168,7 @@ def trim_history(history: list) -> list:
         total_chars -= len(removed["content"])
 
     return system_msgs + other_msgs
+
 
 def build_system_prompt(mem: dict) -> str:
     facts_str = (
@@ -188,18 +207,50 @@ MEMORY: <fakta singkat untuk disimpan>
 ## WAKTU SEKARANG: {now}
 """
 
+def ask_mode() -> bool:
+    """
+    Tanya mode sebelum AI mulai merespons.
+    Return True  = Kreatif (unlimited steps)
+    Return False = Normal  (MAX_STEPS)
+    """
+    try:
+        ans = input("\033[36m🎨 AI Mode Kreatif? [Y/n] > \033[0m").strip().lower()
+        return ans in ("", "y", "yes")
+    except KeyboardInterrupt:
+        return False
+
+
 def solve(goal: str, mem: dict):
+
+    creative = ask_mode()
+
+    if creative:
+        step_limit = 999
+        mode_label = "\033[36m♾️  KREATIF\033[0m"
+    else:
+        step_limit = MAX_STEPS
+        mode_label = f"\033[90m⏱️  NORMAL (maks {MAX_STEPS} step)\033[0m"
+
+    print(f"\033[90mMode: {mode_label}\033[0m")
+    print(f"\n\033[95m🚀 TARGET: {goal}\033[0m")
+
     history = [
         {"role": "system", "content": build_system_prompt(mem)},
         {"role": "user",   "content": f"GOAL: {goal}"}
     ]
 
-    print(f"\n\033[95m🚀 TARGET: {goal}\033[0m")
-
     bad_count = 0
+    step      = 0
 
-    for step in range(1, MAX_STEPS + 1):
-        print(f"\n\033[94m[Step {step}/{MAX_STEPS}]\033[0m", end=" ", flush=True)
+    while True:
+        step += 1
+
+        if not creative and step > step_limit:
+            print(f"\n\033[91m⚠️  Maks step ({step_limit}) tercapai tanpa jawaban final.\033[0m")
+            break
+
+        label = f"{step}/∞" if creative else f"{step}/{step_limit}"
+        print(f"\n\033[94m[Step {label}]\033[0m", end=" ", flush=True)
 
         history = trim_history(history)
         res = call_llm(history)
@@ -240,11 +291,9 @@ def solve(goal: str, mem: dict):
         if thought:
             print(f"\033[93m💭 {thought}\033[0m")
 
-
         if memory_note:
             add_fact(mem, memory_note)
             print(f"\033[35m🧠 SAVED: {memory_note}\033[0m")
-
 
         if action:
             print(f"\033[92m⚡ CMD: {action}\033[0m")
@@ -266,9 +315,6 @@ def solve(goal: str, mem: dict):
             print(f"\n\033[1;32m✅ FINAL: {final}\033[0m")
             add_fact(mem, f"Selesai: '{goal[:60]}'")
             break
-
-    else:
-        print(f"\n\033[91m⚠️ Maks step ({MAX_STEPS}) tercapai tanpa jawaban final.\033[0m")
 
 if __name__ == "__main__":
     os.system("clear")
