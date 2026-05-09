@@ -17,6 +17,111 @@ MAX_RETRIES = 3
 
 MEMORY_FILE = os.path.expanduser("~/.xzv_agent_memory.json")
 
+# ========== DAFTAR PERINTAH BERBAHAYA YANG DIBLOKIR ==========
+BLOCKED_PATTERNS = [
+    "rm -rf /",
+    "rm -rf *",
+    ":(){ :|:& };:",
+    "dd if=/dev/zero",
+    "mkfs",
+    "chmod 777",
+    "chmod -R 777",
+    "sudo",
+    "curl.*sh",
+    "wget.*|sh",
+    "wget.*-O-.*sh",
+    "alias",
+    "> /dev/sda",
+    "fork bomb",
+    "mv / /dev/null",
+    "kill -9",
+    "pkill",
+    "killall",
+    "shutdown",
+    "reboot",
+    "halt",
+    "init 0",
+    "poweroff",
+    "dd if=/dev/urandom of=/dev/sda",
+    "cat /dev/zero > /dev/sda",
+    "echo '* * * * * rm -rf' > /etc/crontab",
+    ":(){ :|:& };:",
+    "python -c 'import os; os.system'",
+    "perl -e 'exec'",
+    "ruby -e 'exec'",
+    "eval",
+    "exec >",
+    "base64 -d",
+    "openssl enc -d",
+    "nc -e",
+    "bash -i >&",
+    "telnet",
+    "ssh -D",
+    "chroot",
+    "nsenter",
+    "docker run --privileged",
+    "docker exec",
+    "kubectl exec",
+    "systemctl stop",
+    "systemctl disable",
+    "service .* stop",
+    "kill -9 -1",
+    "umount -a",
+    "fdisk",
+    "parted",
+    "gparted",
+    "lvm",
+    "vgremove",
+    "lvremove",
+    "pvremove",
+    "mdadm --stop",
+    "swapoff -a",
+    "echo 1 > /proc/sys/kernel/panic",
+    "sysctl -w",
+    "iptables -F",
+    "iptables -X",
+    "ufw disable",
+    "firewall-cmd --reload",
+]
+
+# ========== PERINTAH YANG PERLU KONFIRMASI (tidak diblokir total) ==========
+DANGEROUS_PATTERNS = [
+    "rm ",
+    "rm -",
+    "mv ",
+    "mv -",
+    "dd ",
+    "dd if=",
+    "chmod ",
+    "chown ",
+    "chgrp ",
+    "kill ",
+    "pkill ",
+    "killall ",
+    "sudo ",
+    "su ",
+    "passwd",
+    "useradd",
+    "userdel",
+    "groupadd",
+    "groupdel",
+    "systemctl ",
+    "systemd",
+    "docker rmi",
+    "docker rm",
+    "docker volume",
+    "docker network",
+    "git push --force",
+    "git push -f",
+    "git reset --hard",
+    "git clean -f",
+    "npx --yes",
+    "curl -sS",
+    "wget -qO-",
+]
+
+SHELL_OPS = [">", ">>", "|", "&&", "||", ";", "$(", "`", "2>", "<"]
+
 def load_memory() -> dict:
     if os.path.exists(MEMORY_FILE):
         try:
@@ -42,13 +147,15 @@ def add_fact(mem: dict, fact: str):
 
 memory = load_memory()
 
-
-BLOCKED_PATTERNS = ["rm -rf /", ":(){ :|:& };:", "dd if=/dev/zero", "mkfs"]
-
-SHELL_OPS = [">", ">>", "|", "&&", "||", ";", "$(", "`", "2>", "<"]
-
 def needs_shell(cmd: str) -> bool:
     return any(op in cmd for op in SHELL_OPS)
+
+def needs_confirmation(cmd: str) -> bool:
+    """Cek apakah command perlu konfirmasi dari user"""
+    for pattern in DANGEROUS_PATTERNS:
+        if pattern in cmd:
+            return True
+    return False
 
 def execute(cmd: str) -> str:
     try:
@@ -56,9 +163,17 @@ def execute(cmd: str) -> str:
         if not cmd:
             return "[EMPTY COMMAND]"
 
+        # Cek blocked patterns dulu
         for bad in BLOCKED_PATTERNS:
-            if bad in cmd:
+            if re.search(bad, cmd, re.IGNORECASE):
                 return f"[BLOCKED] Perintah berbahaya ditolak: '{bad}'"
+
+        # Minta konfirmasi untuk dangerous commands
+        if needs_confirmation(cmd):
+            print(f"\n\033[93m⚠️  PERINTAH DANGEROUS: {cmd}\033[0m")
+            confirm = input("\033[93mYakin mau jalankan? [y/N] > \033[0m").strip().lower()
+            if confirm not in ('y', 'yes'):
+                return "[CANCELLED] Dibatalkan oleh user"
 
         cwd = os.path.expanduser("~")
 
@@ -97,7 +212,6 @@ def execute(cmd: str) -> str:
     except Exception as e:
         return f"[EXCEPTION] {type(e).__name__}: {e}"
 
-
 def call_llm(messages: list) -> str | None:
     try:
         r = requests.post(
@@ -111,7 +225,22 @@ def call_llm(messages: list) -> str | None:
             timeout=90
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        data = r.json()
+        
+        # Validasi response JSON
+        if not data.get("choices"):
+            print(f"\033[91m[LLM ERROR] Response tidak punya 'choices': {data}\033[0m")
+            return None
+        
+        if not data["choices"][0].get("message"):
+            print(f"\033[91m[LLM ERROR] Response tidak punya 'message': {data['choices'][0]}\033[0m")
+            return None
+        
+        if not data["choices"][0]["message"].get("content"):
+            print(f"\033[91m[LLM ERROR] Response tidak punya 'content'\033[0m")
+            return None
+            
+        return data["choices"][0]["message"]["content"]
 
     except requests.exceptions.Timeout:
         print("\033[91m[LLM TIMEOUT] Server tidak merespons dalam 90s\033[0m")
@@ -152,10 +281,8 @@ def parse_response(res: str) -> tuple[str, str, str, str]:
 
     return thought, action, final, memory_note
 
-
 def is_valid(thought: str, action: str, final: str) -> bool:
     return bool(thought or action or final)
-
 
 def trim_history(history: list) -> list:
     """Pertahankan system prompt + trim pesan lama jika context terlalu besar."""
@@ -168,7 +295,6 @@ def trim_history(history: list) -> list:
         total_chars -= len(removed["content"])
 
     return system_msgs + other_msgs
-
 
 def build_system_prompt(mem: dict) -> str:
     facts_str = (
@@ -218,7 +344,6 @@ def ask_mode() -> bool:
         return ans in ("", "y", "yes")
     except KeyboardInterrupt:
         return False
-
 
 def solve(goal: str, mem: dict):
 
